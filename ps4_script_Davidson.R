@@ -139,3 +139,20 @@ forecast::dm.test(
   power = 2
 )
 
+
+# 3a
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+# Compare forecast accuracy
+liquor_combo_fc |>
+  accuracy(
+    liquor,
+    measures = list(RMSE = RMSE, MAE = MAE)
+  )
+
+
+# 3B
+
+cor(liquor_errs$arima, liquor_errs$ets)
