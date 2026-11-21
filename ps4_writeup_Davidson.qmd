@@ -1,0 +1,454 @@
+---
+title: "Problem Set 4"
+author: "Lucas Davidson"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+**GitHub repo:** <https://github.com/YOUR_USERNAME/ec422_ps4_Davidson>
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(fpp3)
+library(BVAR)
+```
+
+## ARIMA vs. ETS
+
+### 2.1 Data and Seasonal Patterns
+
+```{r}
+liquor_raw <- read_csv(
+  "data/MRTSSM4453USN.csv",
+  na = ".",
+  col_types = cols(
+    observation_date = col_date(format = "%Y-%m-%d"),
+    MRTSSM4453USN = col_double()
+  )
+)
+
+liquor <- liquor_raw |>
+  transmute(
+    Month = yearmonth(observation_date),
+    sales = MRTSSM4453USN
+  ) |>
+  as_tsibble(index = Month) |>
+  filter(Month <= yearmonth("2019 Dec"))
+
+has_gaps(liquor)
+```
+
+The dataset contains monthly U.S. beer, wine, and liquor store sales from January 1992 through December 2019, with no missing months.
+
+```{r}
+liquor |>
+  autoplot(sales) +
+  labs(
+    title = "U.S. Beer, Wine, and Liquor Store Sales",
+    x = "Year",
+    y = "Sales (Millions of Dollars)"
+  )
+```
+
+```{r}
+liquor |>
+  gg_season(log(sales)) +
+  labs(
+    title = "Seasonal Pattern of Liquor Store Sales",
+    x = "Month",
+    y = "Log of Sales"
+  )
+```
+
+Liquor store sales show a clear upward trend from 1992 to 2019 with strong seasonal fluctuations. Sales are consistently highest in December, likely due to holiday spending, while January and February generally have the lowest sales. There is also a smaller increase during the summer months. The seasonal fluctuations grow larger as the overall level of sales increases, suggesting multiplicative seasonality. Taking the logarithm of sales helps stabilize these fluctuations.
+
+### 2.2 Model Estimation and Residual Diagnostics
+
+```{r}
+liquor_fit <- liquor |>
+  model(
+    arima = ARIMA(log(sales)),
+    ets = ETS(log(sales))
+  )
+
+liquor_fit |>
+  select(arima) |>
+  report()
+
+liquor_fit |>
+  select(ets) |>
+  report()
+```
+
+The selected ARIMA model was ARIMA(1,0,2)(2,1,1)[12] with drift. The model uses no regular differencing but applies one seasonal difference at a lag of 12 months. The selected ETS model was ETS(A,A,A), meaning it uses additive errors, an additive trend, and additive seasonality on the log-transformed sales series.
+
+```{r}
+liquor_fit |>
+  select(arima) |>
+  gg_tsresiduals()
+
+liquor_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24, dof = 6)
+```
+
+Although the residuals appear centered around zero, several autocorrelations fall outside the significance bounds. The Ljung-Box test produced a statistic of approximately 120 with a p-value close to zero. So we reject the null hypothesis of no autocorrelation and conclude that the residuals do not behave like white noise. However, this does not necessarily mean that the ARIMA model will produce inaccurate forecasts.
+
+### 2.3 Forecasting Horse Race
+
+```{r}
+liquor_cv_fit <- readRDS("results/liquor_cv_fit.rds")
+
+liquor_cv_fc <- liquor_cv_fit |>
+  forecast(h = 1)
+
+liquor_accuracy <- liquor_cv_fc |>
+  accuracy(
+    liquor,
+    measures = list(RMSE = RMSE, MAE = MAE)
+  )
+
+liquor_accuracy |>
+  knitr::kable(digits = 2)
+```
+
+The expanding window cross validation uses an initial training sample of 120 months and evaluates 216 forecast origins. The first forecast is for January 2002, and the last forecast is for December 2019.
+
+ARIMA produces the most accurate forecasts, with an RMSE of approximately 81.4 and an MAE of 65.7. Both accuracy measures agree that ARIMA performs best, followed by ETS and then the seasonal random walk benchmark.
+
+### 2.4 Diebold-Mariano Tests
+
+```{r}
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(
+    as_tibble(liquor) |>
+      select(Month, actual = sales),
+    by = "Month"
+  ) |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e)
+
+forecast::dm.test(
+  liquor_errs$arima,
+  liquor_errs$ets,
+  h = 1,
+  power = 2
+)
+
+forecast::dm.test(
+  liquor_errs$arima,
+  liquor_errs$snaive,
+  h = 1,
+  power = 2
+)
+```
+
+The Diebold Mariano test comparing ARIMA and ETS produced a test statistic of -2.9062 and a p-value of 0.004042. The comparison between ARIMA and the seasonal random walk produced a test statistic of -10.755 and a p-value below 2.2e-16. Both results are statistically significant at the 5% significance level.
+
+If I were forecasting sales for the liquor store chain, I would choose ARIMA because it has the lowest RMSE and MAE, and its improvements over both competing models are statistically significant.
+
+## Forecast Combination
+
+### 3a. Equal-Weight Forecast Combination
+
+```{r}
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(
+    liquor,
+    measures = list(RMSE = RMSE, MAE = MAE)
+  ) |>
+  knitr::kable(digits = 2)
+```
+
+The equal weight forecast combination produces an RMSE of approximately 85.2 and an MAE of 66.8. The combination performs better than ETS alone but worse than ARIMA alone according to both accuracy measures. Therefore, combining the two models does not improve forecasting accuracy relative to the best individual model.
+
+### 3b. Forecast Error Correlation
+
+```{r}
+cor(liquor_errs$arima, liquor_errs$ets)
+```
+
+The correlation between the ARIMA and ETS forecast errors is approximately 0.8783, indicating a strong positive relationship. Because the models tend to make similar errors, combining them provides limited opportunities for those errors to cancel each other out. Additionally, the Diebold Mariano test in Part 2.4 showed that ARIMA significantly outperforms ETS, which helps explain why giving both models equal weight reduces accuracy compared to using ARIMA alone.
+
+## VAR vs. BVAR
+
+### 4.1 Data and Cross-Validation
+
+```{r}
+qd_raw <- read_csv(
+  "data/fredqd_2026-09.csv",
+  show_col_types = FALSE
+) |>
+  slice(-(1:2))
+
+growth <- function(x) 100 * difference(log(x))
+
+qd <- qd_raw |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+  transmute(
+    date,
+    gdp = growth(GDPC1),
+    cons = growth(PCECC96),
+    inv = growth(GPDIC1),
+    emp = growth(PAYEMS),
+    infl = growth(GDPCTPI),
+    unrate = difference(UNRATE),
+    ffr = difference(FEDFUNDS),
+    gs10 = difference(GS10)
+  ) |>
+  filter(
+    date >= as.Date("1960-03-01"),
+    date <= as.Date("2019-12-01")
+  )
+
+y <- qd |>
+  select(-date) |>
+  as.matrix()
+
+dim(y)
+```
+
+The dataset contains 240 quarterly observations for eight macroeconomic variables from 1960 Q1 through 2019 Q4. The initial training sample contains 120 quarters, leaving 120 one-quarter-ahead forecasts for each variable. The first forecast is for 1990 Q1, and the last forecast is for 2019 Q4.
+
+### 4.2 OLS VAR Comparison
+
+The VAR(1) produces a lower RMSE than the VAR(4) for seven of the eight variables. Inflation is the only variable for which the VAR(4) performs better.
+
+Although the VAR(4) contains the VAR(1) as a special case, it requires estimating 264 coefficients compared to only 72 for the VAR(1). Estimating more parameters increases the risk of overfitting and estimation uncertainty. This explains why the simpler VAR(1) can produce more accurate out-of-sample forecasts.
+
+### 4.3 Bayesian VAR and Shrinkage
+
+```{r}
+var_results <- readRDS("results/var_results.rds")
+
+var_results |>
+  knitr::kable(digits = 3)
+```
+
+The BVAR(4) with lambda = 0.3 produces a lower RMSE than the OLS VAR(4) for all eight variables. Since both models use the same variables and number of lags, the improvement can be attributed to Bayesian shrinkage, which reduces estimation uncertainty by shrinking coefficients toward zero.
+
+However, the VAR(1) still outperforms the BVAR with lambda = 0.3 for five of the eight variables. This demonstrates that even with shrinkage, a simpler model can be difficult to beat.
+
+Reducing lambda to 0.05 increases the amount of shrinkage. This worsens forecast accuracy relative to lambda = 0.3 for seven of the eight variables, although it improves federal funds rate forecasts. This suggests that excessive shrinkage can remove useful predictive information. There is a trade-off between reducing estimation uncertainty and introducing bias.
+
+If I selected the best forecasting model using this table, its RMSE would not necessarily be a fair estimate of future forecasting accuracy. Selecting the winner using the same observations used to evaluate the models can produce an overly optimistic estimate. An additional independent test sample would provide a fairer evaluation.
+
+### 4.3c Diebold-Mariano Tests
+For GDP growth, the Diebold-Mariano test produces a p-value of 0.03468. Since this is below 0.05, we reject the null hypothesis of equal forecast accuracy and conclude that the BVAR(4) with lambda = 0.3 performs significantly better than the OLS VAR(4).
+
+For investment growth, the p-value is 0.1065. Although the BVAR produces a lower RMSE, the improvement is not statistically significant at the 5% significance level.
+
+These results suggest that Bayesian shrinkage can improve forecasting accuracy, but a lower RMSE does not necessarily mean that the improvement is statistically significant.
+
+## Factor Model
+
+### 5.1 Data and Transformations
+
+```{r}
+md_raw <- read_csv(
+  "data/fredmd_2026-09.csv",
+  show_col_types = FALSE
+)
+
+tcode <- unlist(md_raw[1, -1])
+
+md <- md_raw[-1, ] |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+
+  switch(
+    as.character(code),
+    "1" = x,
+    "2" = d(x),
+    "3" = d(d(x)),
+    "4" = log(x),
+    "5" = 100 * d(log(x)),
+    "6" = 100 * d(d(log(x))),
+    "7" = d(x / dplyr::lag(x) - 1)
+  )
+}
+
+fm <- map2_dfc(
+  md[names(tcode)],
+  tcode,
+  transform_series
+) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(
+    date >= as.Date("1960-03-01"),
+    date <= as.Date("2019-12-01")
+  )
+
+fm <- fm[, colSums(is.na(fm)) == 0]
+
+dim(fm)
+```
+
+After applying the transformations and removing series with missing observations, the dataset contains 718 monthly observations and 121 economic series, plus the date column.
+
+```{r}
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+```
+
+- INDPRO (5): The first difference of the logarithm multiplied by 100 measures monthly industrial production growth.
+- PAYEMS (5): The first difference of the logarithm multiplied by 100 measures monthly employment growth.
+- CPIAUCSL (6): The second difference of the logarithm multiplied by 100 measures the change in monthly inflation.
+- FEDFUNDS (2): The first difference measures the monthly change in the federal funds rate in percentage points.
+
+The federal funds rate is transformed differently from industrial production because it is already expressed as a percentage. Measuring changes in percentage points is more appropriate than calculating its percentage growth rate.
+
+### 5.2 Estimating the Factors
+
+```{r}
+Z <- fm |>
+  select(-date) |>
+  as.matrix()
+
+pc <- prcomp(scale(Z))
+
+summary(pc)$importance[, 1:5] |>
+  knitr::kable(digits = 4)
+```
+
+The first factor explains approximately 14.98% of the total variation, the second explains 7.41%, and the third explains 7.06%. Together, the first three factors explain approximately 29.45% of the variation across all 121 economic series.
+
+```{r}
+F1 <- pc$x[, 1] *
+  sign(cor(pc$x[, 1], fm$INDPRO))
+
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(
+    title = "First Factor from FRED-MD",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+The first factor shows large negative movements during major economic downturns, particularly in the mid-1970s, early 1980s, and during the Great Recession of 2008–2009. The factor generally recovers following these downturns, suggesting that it captures fluctuations in overall economic activity.
+
+```{r}
+factor1_cor <- sort(
+  abs(cor(pc$x[, 1], Z))[1, ],
+  decreasing = TRUE
+)[1:8]
+
+factor2_cor <- sort(
+  abs(cor(pc$x[, 2], Z))[1, ],
+  decreasing = TRUE
+)[1:8]
+
+tibble(
+  `Factor 1 Series` = names(factor1_cor),
+  `Correlation 1` = as.numeric(factor1_cor),
+  `Factor 2 Series` = names(factor2_cor),
+  `Correlation 2` = as.numeric(factor2_cor)
+) |>
+  knitr::kable(digits = 3)
+```
+
+The first factor is strongly correlated with employment and production variables, including nonfarm payroll employment, manufacturing production, goods-producing employment, and industrial production. These correlations, along with the graph, suggest that the first factor captures overall economic activity and business cycle fluctuations.
+
+The second factor is strongly correlated with price-related variables, including the Consumer Price Index and the Personal Consumption Expenditures Price Index. This suggests that the second factor captures common movements in inflation-related measures.
+
+### 5.3 Industrial Production Forecasting
+
+```{r}
+ip <- fm$INDPRO
+n <- nrow(Z)
+
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+
+for (T in init:(n - 1)) {
+
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]
+
+  d <- data.frame(
+    y_next = ip[2:T],
+    y = ip[1:(T - 1)],
+    F_T[1:(T - 1), ]
+  )
+
+  new <- data.frame(
+    y = ip[T],
+    t(F_T[T, ])
+  )
+
+  e_ar <- c(
+    e_ar,
+    ip[T + 1] - predict(lm(y_next ~ y, d), new)
+  )
+
+  e_fa <- c(
+    e_fa,
+    ip[T + 1] - predict(lm(y_next ~ ., d), new)
+  )
+}
+
+tibble(
+  Model = c("AR(1)", "Factor-Augmented AR(1)"),
+  RMSE = c(
+    sqrt(mean(e_ar^2)),
+    sqrt(mean(e_fa^2))
+  )
+) |>
+  knitr::kable(digits = 4)
+```
+
+The AR(1) model produces an RMSE of approximately 0.617, while the factor-augmented model produces an RMSE of approximately 0.589. These results match the results from class and demonstrate that including the three factors improves industrial production forecasts, reducing RMSE by approximately 4.6%.
+
+Estimating the factors once using the full sample would introduce information from future observations that would not have been available at the forecast origin. This would create data leakage and could make the forecasting results overly optimistic. Re-estimating the factors at each forecast origin ensures that only information through that point in time is used.
+
+### 5.4 Direct Forecast of Inflation
+
+```{r}
+inflation_results <- readRDS(
+  "results/inflation_results.rds"
+)
+
+inflation_results |>
+  knitr::kable(digits = 6)
+```
+
+```{r}
+inflation_results |>
+  mutate(
+    RMSE_reduction = 100 *
+      (RMSE_AR - RMSE_FA) / RMSE_AR
+  ) |>
+  select(RMSE_reduction) |>
+  knitr::kable(digits = 2)
+```
+
+Adding the three factors improves the direct forecasts of CPI inflation over the next 12 months. Across 349 forecasts, the RMSE decreases from approximately 2.11 to 1.89, a reduction of approximately 10.4%. The MAE also decreases from 1.58 to 1.35.
+
+The Diebold-Mariano test produces a p-value of approximately 0.000443. Since this is below 0.05, we reject the null hypothesis of equal forecast accuracy. The improvement from including the factors is statistically significant. The Bartlett variance estimator accounts for the autocorrelation associated with overlapping 12-month forecasts.
+
+These results suggest that factors estimated from a large number of economic variables contain useful information for forecasting future inflation.
+
+## Reflection
+
+Throughout this problem set I learned that more complex forecasting models do not necessarily produce more accurate forecasts. For example, the VAR(1) outperformed the VAR(4) for seven of the eight variables, showing how estimating too many parameters can lead to overfitting. I also learned that combining forecasts is not always beneficial, especially when the models have highly correlated forecast errors. Shrinkage, equal-weight forecast combinations, and factor models all attempt to manage model complexity and reduce estimation uncertainty in different ways. The factor models were particularly interesting because they improved forecasts of both industrial production and inflation while summarizing information from 121 economic series into only three factors. Overall, this problem set showed the importance of balancing model complexity with forecast accuracy and evaluating models using out-of-sample observations.
