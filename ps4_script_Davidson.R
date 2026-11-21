@@ -4,7 +4,6 @@ library(BVAR)
 
 
 # 2.1a
-
 liquor_raw <- read_csv(
   "data/MRTSSM4453USN.csv",
   na = ".",
@@ -27,7 +26,6 @@ has_gaps(liquor)
 
 
 # 2.1b
-
 # Graph 1: Monthly sales over time
 liquor |>
   autoplot(sales) +
@@ -48,7 +46,6 @@ liquor |>
 
 
 # 2.2a
-
 liquor_fit <- liquor |>
   model(
     arima = ARIMA(log(sales)),
@@ -67,7 +64,6 @@ liquor_fit |>
 
 
 # 2.2b
-
 # Plot residuals
 liquor_fit |>
   select(arima) |>
@@ -81,7 +77,6 @@ liquor_fit |>
 
 
 # 2.3a
-
 liquor_cv <- liquor |>
   stretch_tsibble(.init = 120, .step = 1) |>
   filter(.id < max(.id))
@@ -95,3 +90,52 @@ liquor_cv_fit <- liquor_cv |>
 
 # Save fitted models so we don't need to rerun them
 saveRDS(liquor_cv_fit, "results/liquor_cv_fit.rds")
+
+
+# 2.3b
+liquor_cv_fc <- liquor_cv_fit |>
+  forecast(h = 1)
+
+# Calculate forecast accuracy
+liquor_accuracy <- liquor_cv_fc |>
+  accuracy(
+    liquor,
+    measures = list(RMSE = RMSE, MAE = MAE)
+  )
+
+liquor_accuracy
+
+
+# 2.4
+# Calculate forecast errors for each model
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(
+    as_tibble(liquor) |>
+      select(Month, actual = sales),
+    by = "Month"
+  ) |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(
+    names_from = .model,
+    values_from = e
+  )
+
+# DM Test ARIMA vs. ETS
+forecast::dm.test(
+  liquor_errs$arima,
+  liquor_errs$ets,
+  h = 1,
+  power = 2
+)
+
+
+# DM Test ARIMA vs. Seasonal Naive
+forecast::dm.test(
+  liquor_errs$arima,
+  liquor_errs$snaive,
+  h = 1,
+  power = 2
+)
+
